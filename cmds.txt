@@ -1,0 +1,30 @@
+ source ~/torch-mam/bin/activate
+
+     # Quick test with nano variant
+     python rf-detr/train.py --val-object SI3781 --variant nano --epochs 10 --batch-size 2
+
+     # Full run with 2XLarge
+     python rf-detr/train.py --val-object SI3781 --test-object SI3782 --epochs 100 --wandb
+
+     # Resume from checkpoint
+     python rf-detr/train.py --val-object SI3781 --resume ./rf-detr-output/checkpoints/last.ckpt
+
+
+
+~/torch-mam/lib/python3.11/site-packages/rfdetr
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
