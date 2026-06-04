@@ -266,17 +266,19 @@ def parse_args(args=None):
     parser.add_argument("--variant", type=str, default="large",
         choices=["nano", "small", "medium", "large", "xlarge", "2xlarge", "base"],
         help="RF-DETR model variant")
-    parser.add_argument("--resolution", type=int, default=928,
+    parser.add_argument("--resolution", type=int, default=1280,
         help="Override input resolution (default: variant-specific)")
     parser.add_argument("--num-classes", type=int, default=7,
         help="Number of output classes")
+    parser.add_argument("--proj-size", type=int, default=0,
+        help="Linear attention projection size (0 = disable, use standard attention)")
 
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=100,
         help="Number of training epochs")
     parser.add_argument("--batch-size", type=str, default="2",
         help="Per-GPU batch size or 'auto' for automatic probing")
-    parser.add_argument("--grad-accum-steps", type=int, default=4,
+    parser.add_argument("--grad-accum-steps", type=int, default=2,
         help="Gradient accumulation steps")
     parser.add_argument("--lr", type=float, default=1e-4,
         help="Base learning rate")
@@ -343,6 +345,7 @@ def main():
     print(f"  Batch size:   {args.batch_size}")
     print(f"  LR:           {args.lr}")
     print(f"  Device(s):    {args.device}")
+    print(f"  Proj size:    {args.proj_size} {'(linear attention)' if args.proj_size > 0 else '(standard attention)'}")
     print("=" * 80)
 
     # ---- Step 1: Prepare dataset by machine-ID split ----
@@ -377,6 +380,7 @@ def main():
 
     model_kwargs = {
         "num_classes": args.num_classes,
+        "proj_size": args.proj_size,
     }
     if args.resolution is not None:
         model_kwargs["resolution"] = args.resolution

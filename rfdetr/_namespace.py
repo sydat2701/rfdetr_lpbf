@@ -44,6 +44,7 @@ _MC_NAMESPACE_FIELDS = {
     "patch_size",
     "positional_encoding_size",
     "pretrain_weights",
+    "proj_size",
     "projector_scale",
     "resolution",
     "sa_nheads",

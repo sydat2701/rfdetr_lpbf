@@ -72,6 +72,7 @@ class BuilderArgs(Protocol):
     use_cls_token: bool
     pretrained_encoder: Optional[str]
     backbone_only: bool
+    proj_size: int
     encoder_only: bool
     # --- Criterion ---
     # Note: `decoder_norm`, `dropout`, and `num_feature_levels` are consumed by

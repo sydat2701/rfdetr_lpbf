@@ -66,6 +66,7 @@ class DinoV2(nn.Module):
         num_windows=4,
         positional_encoding_size=37,
         drop_path_rate=0.0,
+        proj_size=64,
     ):
         super().__init__()
 
@@ -127,6 +128,8 @@ class DinoV2(nn.Module):
                     num_windows=num_windows,
                     window_block_indexes=window_block_indexes,
                     gradient_checkpointing=gradient_checkpointing,
+                    proj_size=proj_size,
+                    resolution=shape[0],
                 )
             else:
                 windowed_dino_config = WindowedDinov2WithRegistersConfig(
@@ -135,6 +138,8 @@ class DinoV2(nn.Module):
                     window_block_indexes=window_block_indexes,
                     num_register_tokens=0,
                     gradient_checkpointing=gradient_checkpointing,
+                    proj_size=proj_size,
+                    resolution=shape[0],
                 )
             self.encoder = (
                 WindowedDinov2WithRegistersBackbone.from_pretrained(

@@ -51,6 +51,7 @@ class Backbone(BackboneBase):
         patch_size: int = 14,
         num_windows: int = 4,
         positional_encoding_size: int = 0,
+        proj_size: int = 64,
     ):
         super().__init__()
         # an example name here would be "dinov2_base" or "dinov2_registers_windowed_base"
@@ -84,6 +85,7 @@ class Backbone(BackboneBase):
             num_windows=num_windows,
             positional_encoding_size=positional_encoding_size,
             drop_path_rate=drop_path,
+            proj_size=proj_size,
         )
         # build encoder + projector as backbone module
         if freeze_encoder:

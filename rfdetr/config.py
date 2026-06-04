@@ -115,6 +115,10 @@ class ModelConfig(BaseConfig):
     compile: bool = False
     fused_optimizer: bool = True
     positional_encoding_size: int
+    proj_size: int = Field(
+        default=64,
+        description="Projection size for linear self-attention (UNETR++ style). Used when attn_implementation='linear'.",
+    )
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False

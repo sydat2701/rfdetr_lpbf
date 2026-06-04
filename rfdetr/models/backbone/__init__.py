@@ -69,6 +69,7 @@ def build_backbone(
     patch_size,
     num_windows,
     positional_encoding_size,
+    proj_size=64,
 ):
     """
     Useful args:
@@ -99,6 +100,7 @@ def build_backbone(
         patch_size=patch_size,
         num_windows=num_windows,
         positional_encoding_size=positional_encoding_size,
+        proj_size=proj_size,
     )
 
     model = Joiner(backbone, position_embedding)

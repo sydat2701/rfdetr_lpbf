@@ -425,6 +425,7 @@ def build_model(args: "BuilderArgs"):
         patch_size=args.patch_size,
         num_windows=args.num_windows,
         positional_encoding_size=args.positional_encoding_size,
+        proj_size=args.proj_size,
     )
     if args.encoder_only:
         return backbone[0].encoder, None, None

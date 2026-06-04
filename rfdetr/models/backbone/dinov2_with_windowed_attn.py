@@ -250,6 +250,8 @@ class WindowedDinov2WithRegistersConfig(BackboneConfigMixin, PretrainedConfig):
         num_windows=1,
         window_block_indexes=None,
         gradient_checkpointing=False,
+        proj_size=64,
+        resolution=0,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -278,10 +280,10 @@ class WindowedDinov2WithRegistersConfig(BackboneConfigMixin, PretrainedConfig):
         self.apply_layernorm = apply_layernorm
         self.reshape_hidden_states = reshape_hidden_states
         self.num_windows = num_windows
-        self.window_block_indexes = (
-            list(range(num_hidden_layers)) if window_block_indexes is None else window_block_indexes
-        )
+        self.window_block_indexes = window_block_indexes
         self.gradient_checkpointing = gradient_checkpointing
+        self.proj_size = proj_size
+        self.resolution = resolution
 
 
 class Dinov2WithRegistersPatchEmbeddings(nn.Module):
@@ -507,6 +509,8 @@ class Dinov2WithRegistersSelfAttention(nn.Module):
 
         # Normalize the attention scores to probabilities.
         attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        # print(">"*20, "6", attention_probs.shape)
+        # exit()
 
         # This is actually dropping out entire tokens to attend to, which might
         # seem a bit unusual, but is taken from the original Transformer paper.
@@ -546,6 +550,8 @@ class Dinov2WithRegistersSdpaSelfAttention(Dinov2WithRegistersSelfAttention):
         key_layer = self.transpose_for_scores(self.key(hidden_states))
         value_layer = self.transpose_for_scores(self.value(hidden_states))
         query_layer = self.transpose_for_scores(mixed_query_layer)
+        # print("+"*20, "1", query_layer.shape, key_layer.shape, value_layer.shape)
+        # exit()
 
         context_layer = torch.nn.functional.scaled_dot_product_attention(
             query_layer,
@@ -562,6 +568,57 @@ class Dinov2WithRegistersSdpaSelfAttention(Dinov2WithRegistersSelfAttention):
         context_layer = context_layer.view(new_context_layer_shape)
 
         return context_layer, None
+
+
+class Dinov2WithRegistersLinearSelfAttention(nn.Module):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__()
+        self.num_heads = config.num_attention_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.hidden_size = config.hidden_size
+
+        self.temperature = nn.Parameter(torch.ones(self.num_heads, 1, 1))
+        self.qkv = nn.Linear(config.hidden_size, config.hidden_size * 3, bias=config.qkv_bias)
+        self.E = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.F = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        self.proj_size = config.proj_size
+        self.attn_drop = nn.Dropout(config.attention_probs_dropout_prob)
+
+    def _pool(self, x: torch.Tensor) -> torch.Tensor:
+        P = self.proj_size
+        N = x.shape[-1]
+        if N <= P:
+            return x
+        stride = N // P
+        kernel_size = N - (P - 1) * stride
+        return torch.nn.functional.avg_pool1d(x, kernel_size=kernel_size, stride=stride)
+
+    def forward(
+        self, hidden_states: torch.Tensor, output_attentions: bool = False
+    ) -> Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor]]:
+        B, N, C = hidden_states.shape
+
+        qkv = self.qkv(hidden_states).reshape(B, N, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # each (B, H, N, d)
+
+        k = self.E(k)  # (B, H, N, d) → (B, H, N, d)
+        v = self.F(v)  # (B, H, N, d) → (B, H, N, d)
+
+        k_flat = k.reshape(B * self.num_heads, N, self.head_dim).permute(0, 2, 1)  # (B*H, d, N)
+        k_pooled = self._pool(k_flat).permute(0, 2, 1).reshape(B, self.num_heads, -1, self.head_dim)
+
+        v_flat = v.reshape(B * self.num_heads, N, self.head_dim).permute(0, 2, 1)  # (B*H, d, N)
+        v_pooled = self._pool(v_flat).permute(0, 2, 1).reshape(B, self.num_heads, -1, self.head_dim)
+
+        attn = (q @ k_pooled.transpose(-2, -1)) * self.temperature  # (B, H, N, P)
+        attn = attn.softmax(dim=-1)
+        attn = self.attn_drop(attn)
+
+        x = attn @ v_pooled  # (B, H, N, d)
+        x = x.permute(0, 2, 1, 3).reshape(B, N, C)
+
+        return x, None
 
 
 class Dinov2WithRegistersSelfOutput(nn.Module):
@@ -622,6 +679,12 @@ class Dinov2WithRegistersSdpaAttention(Dinov2WithRegistersAttention):
     def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
         super().__init__(config)
         self.attention = Dinov2WithRegistersSdpaSelfAttention(config)
+
+
+class Dinov2WithRegistersLinearAttention(Dinov2WithRegistersAttention):
+    def __init__(self, config: WindowedDinov2WithRegistersConfig) -> None:
+        super().__init__(config)
+        self.attention = Dinov2WithRegistersLinearSelfAttention(config)
 
 
 class Dinov2WithRegistersLayerScale(nn.Module):
@@ -705,6 +768,7 @@ class Dinov2WithRegistersSwiGLUFFN(nn.Module):
 DINOV2_WITH_REGISTERS_ATTENTION_CLASSES = {
     "eager": Dinov2WithRegistersAttention,
     "sdpa": Dinov2WithRegistersSdpaAttention,
+    "linear": Dinov2WithRegistersLinearAttention,
 }
 
 
@@ -717,7 +781,10 @@ class WindowedDinov2WithRegistersLayer(nn.Module):
         self.num_windows = config.num_windows
 
         self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.attention = DINOV2_WITH_REGISTERS_ATTENTION_CLASSES[config._attn_implementation](config)
+        if config.proj_size > 0:
+            self.attention = Dinov2WithRegistersLinearAttention(config)
+        else:
+            self.attention = DINOV2_WITH_REGISTERS_ATTENTION_CLASSES[config._attn_implementation](config)
         self.layer_scale1 = Dinov2WithRegistersLayerScale(config)
         self.drop_path = (
             Dinov2WithRegistersDropPath(config.drop_path_rate) if config.drop_path_rate > 0.0 else nn.Identity()
