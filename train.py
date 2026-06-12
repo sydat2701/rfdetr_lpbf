@@ -19,6 +19,17 @@ import re
 import shutil
 import time
 from collections import defaultdict
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+import numpy as np
+import torch
+import torch.nn as nn
+from PIL import Image
+from torchvision.transforms.v2 import Compose, ToDtype, ToImage
+
+from rfdetr.datasets.coco import CocoDetection, build_roboflow_from_coco, make_coco_transforms
+from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
 
 
 VARIANT_STRIDE = {
@@ -75,6 +86,20 @@ def resolve_image_path(file_name, image_dir):
     return None
 
 
+def find_exposure_pair(recoat_path):
+    """Find the exposure image paired with a recoating image path."""
+    dirname = os.path.dirname(recoat_path)
+    basename = os.path.basename(recoat_path)
+    expo_basename = basename.replace("recoating", "exposure")
+    expo_path = os.path.join(dirname, expo_basename)
+    if os.path.isfile(expo_path):
+        return expo_path
+    alt = os.path.join(dirname, "exposure_" + basename.replace("recoating_", ""))
+    if os.path.isfile(alt):
+        return alt
+    return None
+
+
 def prepare_dataset(args):
     """Load COCO JSON, split images by machine ID, copy to output structure."""
     output_data_dir = os.path.join(args.output, "data")
@@ -103,17 +128,21 @@ def prepare_dataset(args):
         machine_to_image_ids[obj_id].append(img["id"])
         image_path_cache[img["id"]] = resolve_image_path(img["file_name"], args.image_dir)
 
-    # Parse val/test objects
+    # Parse val/test/exclude objects
     val_objects = set()
     test_objects = set()
+    exclude_objects = set()
     if args.val_object:
         val_objects = set(o.strip() for o in args.val_object.split(","))
     if args.test_object:
         test_objects = set(o.strip() for o in args.test_object.split(","))
+    if args.exclude_object:
+        exclude_objects = set(o.strip() for o in args.exclude_object.split(","))
 
     # Assign each image to a split
     split_image_ids = {"train": [], "valid": [], "test": []}
     missing_count = 0
+    excluded_count = 0
     for img in coco["images"]:
         img_id = img["id"]
         obj_id = extract_object_id(img["file_name"])
@@ -122,12 +151,18 @@ def prepare_dataset(args):
         if image_path_cache.get(img_id) is None:
             missing_count += 1
             continue
+        if obj_id in exclude_objects:
+            excluded_count += 1
+            continue
         if obj_id in test_objects:
             split_image_ids["test"].append(img_id)
         elif obj_id in val_objects:
             split_image_ids["valid"].append(img_id)
         else:
             split_image_ids["train"].append(img_id)
+
+    if excluded_count:
+        print(f"  Excluded: {excluded_count} images from {sorted(exclude_objects)}")
 
     if missing_count:
         print(f"  Warning: {missing_count} images not found on disk, skipping.")
@@ -163,6 +198,8 @@ def prepare_dataset(args):
         split_annotations = []
         ann_id = 1
         copied = 0
+        exposure_paths = []
+        skipped_no_exposure = 0
 
         for img_id in img_ids:
             img = image_id_to_info[img_id]
@@ -173,9 +210,26 @@ def prepare_dataset(args):
             dst_filename = os.path.basename(img["file_name"])
             dst_path = os.path.join(split_dir, dst_filename)
 
+            # Find and copy exposure pair
+            expo_src = find_exposure_pair(src_path) if args.use_exposure else None
+            if args.use_exposure and expo_src is None:
+                skipped_no_exposure += 1
+                if args.use_exposure == "strict":
+                    raise FileNotFoundError(f"No exposure pair for {src_path}")
+                continue
+
             if not os.path.exists(dst_path) or args.force:
                 shutil.copy2(src_path, dst_path)
                 copied += 1
+
+            if expo_src is not None:
+                expo_dst = os.path.join(split_dir, "exposure", dst_filename)
+                os.makedirs(os.path.dirname(expo_dst), exist_ok=True)
+                if not os.path.exists(expo_dst) or args.force:
+                    shutil.copy2(expo_src, expo_dst)
+                exposure_paths.append(expo_dst)
+            else:
+                exposure_paths.append(None)
 
             split_images.append({
                 "id": img_id,
@@ -191,6 +245,14 @@ def prepare_dataset(args):
                 new_ann["id"] = ann_id
                 ann_id += 1
                 split_annotations.append(new_ann)
+
+        if skipped_no_exposure:
+            print(f"  {split_name}: skipped {skipped_no_exposure} images without exposure pairs")
+
+        # Save exposure paths for the custom dataset
+        expo_json_path = os.path.join(split_dir, "exposure_paths.json")
+        with open(expo_json_path, "w") as f:
+            json.dump(exposure_paths, f)
 
         # Categories keep original IDs; RF-DETR remaps to 0-based internally
         split_categories = [
@@ -216,6 +278,181 @@ def prepare_dataset(args):
         f.write(f"prepared_at={time.time()}\n")
 
     return output_data_dir
+
+
+class PairedNormalize:
+    """Normalize each 3-channel half independently for 6-channel images."""
+
+    def __init__(self):
+        self.norm = Normalize()
+
+    def __call__(self, image, target=None):
+        if image.shape[0] == 6:
+            img_0, _ = self.norm(image[:3], None)
+            img_1, _ = self.norm(image[3:], None)
+            image = torch.cat([img_0, img_1], dim=0)
+            if target is None:
+                return image, None
+            target = target.copy()
+            h, w = image.shape[-2:]
+            if "boxes" in target:
+                from rfdetr.util.box_ops import box_xyxy_to_cxcywh
+
+                boxes = target["boxes"]
+                boxes = box_xyxy_to_cxcywh(boxes)
+                boxes = boxes / torch.tensor([w, h, w, h], dtype=torch.float32)
+                target["boxes"] = boxes
+            return image, target
+        return self.norm(image, target)
+
+
+def make_paired_transforms(image_set, resolution, aug_config, gpu_postprocess):
+    """Build a transform pipeline for 6-channel paired input."""
+    base = make_coco_transforms(
+        image_set,
+        resolution,
+        multi_scale=False,
+        expanded_scales=False,
+        skip_random_resize=False,
+        patch_size=20,
+        num_windows=2,
+        aug_config=aug_config,
+        gpu_postprocess=gpu_postprocess,
+    )
+    adapted = []
+    for t in base.transforms:
+        if isinstance(t, AlbumentationsWrapper):
+            t.return_numpy = True
+            adapted.append(t)
+        elif isinstance(t, Normalize):
+            adapted.append(PairedNormalize())
+        else:
+            adapted.append(t)
+    return Compose(adapted)
+
+
+class PairedCocoDetection(CocoDetection):
+    """CocoDetection that loads paired recoating + exposure images as 6-channel input."""
+
+    def __init__(self, img_folder, ann_file, transforms, exposure_paths, **kwargs):
+        super().__init__(img_folder, ann_file, transforms, **kwargs)
+        self.exposure_paths = exposure_paths
+
+    def _load_exposure(self, idx):
+        path = self.exposure_paths[idx]
+        if path is None:
+            return None
+        return Image.open(path).convert("RGB")
+
+    def __getitem__(self, idx):
+        id = self.ids[idx]
+        recoat_img, raw_target = super(CocoDetection, self).__getitem__(idx)
+        target = {"image_id": id, "annotations": raw_target}
+        recoat_img, target = self.prepare(recoat_img, target)
+
+        expo_img = self._load_exposure(idx)
+        if expo_img is None:
+            raise RuntimeError(f"Exposure image missing at index {idx} (id={id})")
+
+        recoat_np = np.array(recoat_img)
+        expo_np = np.array(expo_img)
+        stacked = np.concatenate([expo_np, recoat_np], axis=2)
+
+        if self._transforms is not None:
+            img, target = self._transforms(stacked, target)
+        else:
+            img = stacked
+
+        return img, target
+
+
+class InputAffine(nn.Module):
+    """Per-channel scale and bias applied before the patch projection conv."""
+
+    def __init__(self, num_channels: int):
+        super().__init__()
+        self.scale = nn.Parameter(torch.ones(num_channels, 1, 1))
+        self.bias = nn.Parameter(torch.zeros(num_channels, 1, 1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return x * self.scale + self.bias
+
+
+def _fix_6ch_conv(nn_model, model_config):
+    """Adapt patch-embedding conv from 3ch to target_ch.
+    Call AFTER load_pretrain_weights so proj.weight already has 3ch pretrained values."""
+    from rfdetr.inference import _adapt_input_conv
+    import copy
+
+    patcher = nn_model.backbone[0].encoder.encoder.embeddings.patch_embeddings
+    proj = patcher.projection
+    target_ch = model_config.num_channels
+    if proj.in_channels == target_ch:
+        return
+
+    # proj.weight already holds the 3-channel pretrained weights
+    new_proj = copy.deepcopy(proj)
+    new_proj.in_channels = target_ch
+    new_proj.weight = torch.nn.Parameter(
+        _adapt_input_conv(target_ch, proj.weight.data)
+    )
+    new_proj.weight.requires_grad = proj.weight.requires_grad
+    patcher.num_channels = target_ch
+    patcher.projection = new_proj
+
+    # Per-channel affine before the projection conv.
+    # 3-channel inputs are padded to target_ch by repeating channels.
+    patcher.affine = InputAffine(target_ch)
+
+    def _patched_forward(pixel_values):
+        n_ch = pixel_values.shape[1]
+        if n_ch != target_ch:
+            repeats = (target_ch + n_ch - 1) // n_ch
+            pixel_values = pixel_values.repeat(1, repeats, 1, 1)[:, :target_ch]
+        pixel_values = patcher.affine(pixel_values)
+        return patcher.projection(pixel_values).flatten(2).transpose(1, 2)
+
+    patcher.forward = _patched_forward
+
+    print(f"  Adapted conv projection: {proj.weight.shape} -> {new_proj.weight.shape}  (affine added)")
+
+
+def _load_exposure_paths(split_dir):
+    """Load exposure paths from JSON, return list or None."""
+    path = os.path.join(split_dir, "exposure_paths.json")
+    if os.path.exists(path):
+        with open(path) as f:
+            return json.load(f)
+    return None
+
+
+_SPLIT_FOLDER = {"train": "train", "val": "valid", "test": "test"}
+
+
+def _build_paired_dataset(image_set, args, resolution):
+    """Build a PairedCocoDetection instead of standard CocoDetection."""
+    split_name = _SPLIT_FOLDER.get(image_set.split("_")[0])
+    if split_name is None:
+        return build_roboflow_from_coco(image_set, args, resolution)
+    split_dir = os.path.join(args.dataset_dir, split_name)
+    exposure_paths = _load_exposure_paths(split_dir)
+    if exposure_paths is None or all(p is None for p in exposure_paths):
+        return build_roboflow_from_coco(image_set, args, resolution)
+
+    aug_config = getattr(args, "aug_config", None)
+    gpu_postprocess = getattr(args, "augmentation_backend", "cpu") != "cpu"
+    paired_transforms = make_paired_transforms(
+        image_set, resolution, aug_config, gpu_postprocess
+    )
+
+    return PairedCocoDetection(
+        img_folder=split_dir,
+        ann_file=os.path.join(split_dir, "_annotations.coco.json"),
+        transforms=paired_transforms,
+        exposure_paths=exposure_paths,
+        include_masks=False,
+        remap_category_ids=True,
+    )
 
 
 def get_model_class(variant):
@@ -257,29 +494,37 @@ def parse_args(args=None):
         help="Force re-prepare dataset even if cached")
 
     # Machine-ID-based split (matches existing --val-object, --test-object pattern)
-    parser.add_argument("--val-object", type=str, default='SI3781',
+    parser.add_argument("--val-object", type=str, default='SI3073',
         help="Machine ID(s) for validation, comma-separated (e.g. 'SI3781')")
-    parser.add_argument("--test-object", type=str, default=None,
+    parser.add_argument("--test-object", type=str, default='SI3785',
         help="Machine ID(s) for test, comma-separated (e.g. 'SI3782')")
+    parser.add_argument("--exclude-object", type=str, default='SI3397',
+        help="Machine ID(s) to exclude entirely, comma-separated (e.g. 'SI3397')")
 
     # Model
-    parser.add_argument("--variant", type=str, default="large",
+    parser.add_argument("--variant", type=str, default="xlarge",
         choices=["nano", "small", "medium", "large", "xlarge", "2xlarge", "base"],
         help="RF-DETR model variant")
-    parser.add_argument("--resolution", type=int, default=1280,
+    parser.add_argument("--resolution", type=int, default=1020,
         help="Override input resolution (default: variant-specific)")
     parser.add_argument("--num-classes", type=int, default=7,
         help="Number of output classes")
     parser.add_argument("--proj-size", type=int, default=0,
         help="Linear attention projection size (0 = disable, use standard attention)")
+    parser.add_argument("--use-exposure", type=str, default=False, nargs="?",
+        const="skip",
+        help="Enable 6-channel input by pairing recoating with exposure images. "
+             "'skip' skips images without pair; 'strict' raises on missing.")
 
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=100,
         help="Number of training epochs")
     parser.add_argument("--batch-size", type=str, default="2",
         help="Per-GPU batch size or 'auto' for automatic probing")
-    parser.add_argument("--grad-accum-steps", type=int, default=2,
+    parser.add_argument("--grad-accum-steps", type=int, default=4,
         help="Gradient accumulation steps")
+    parser.add_argument("--warmup-epochs", type=float, default=3.0,
+        help="Number of warmup epochs (linear warmup from 0 to base LR)")
     parser.add_argument("--lr", type=float, default=1e-4,
         help="Base learning rate")
     parser.add_argument("--lr-encoder", type=float, default=1.5e-4,
@@ -294,8 +539,12 @@ def parse_args(args=None):
     # Optimization extras
     parser.add_argument("--no-ema", action="store_true",
         help="Disable Exponential Moving Average")
-    parser.add_argument("--early-stopping-patience", type=int, default=15,
+    parser.add_argument("--early-stopping-patience", type=int, default=30,
         help="Early stopping patience (epochs)")
+    parser.add_argument("--skip-best-epochs", type=int, default=5,
+        help="Skip first N epochs for early stopping best-score tracking")
+    parser.add_argument("--no-cosine", action="store_true",
+        help="Use step LR scheduler instead of cosine decay")
     parser.add_argument("--fp16-eval", action="store_true",
         help="Use FP16 for evaluation")
     parser.add_argument("--freeze-encoder", action="store_true",
@@ -327,15 +576,17 @@ def main():
         run_name = args.run_name
     else:
         parts = ["rfdetr", args.variant]
+        if args.use_exposure:
+            parts.append("6ch")
         if args.val_object:
             parts.append(f"val{args.val_object.replace(',', '_')}")
         if args.test_object:
             parts.append(f"test{args.test_object.replace(',', '_')}")
         run_name = "-".join(parts)
 
-    print("=" * 80)
+    print("=" * 70)
     print("RF-DETR  L-PBF  Anomaly  Detection")
-    print("=" * 80)
+    print("=" * 70)
     print(f"  Variant:      {args.variant}")
     print(f"  Run name:     {run_name}")
     print(f"  Val machines: {args.val_object or '(none)'}")
@@ -346,7 +597,8 @@ def main():
     print(f"  LR:           {args.lr}")
     print(f"  Device(s):    {args.device}")
     print(f"  Proj size:    {args.proj_size} {'(linear attention)' if args.proj_size > 0 else '(standard attention)'}")
-    print("=" * 80)
+    print(f"  Exposure:     {args.use_exposure or 'disabled'}")
+    print("=" * 70)
 
     # ---- Step 1: Prepare dataset by machine-ID split ----
     print("\n[1/3] Preparing dataset (machine-ID split)...")
@@ -373,6 +625,28 @@ def main():
         print(f"  Warning: {res}px is {(pixels_ratio-1)*100:.0f}% more pixels than default {default_res}.")
         print(f"  Estimated VRAM for batch_size=1: ~{est_vram} GiB. Reduce --batch-size if OOM.")
 
+    # ---- Monkey-patch for 6-channel exposure mode ----
+    if args.use_exposure:
+        import rfdetr.datasets as ds
+        import rfdetr.training.module_model as mm
+
+        original_build_dataset = ds.build_dataset
+        def patched_build_dataset(image_set, args_, resolution):
+            return _build_paired_dataset(image_set, args_, resolution)
+        ds.build_dataset = patched_build_dataset
+
+        # Monkey-patch RFDETRModelModule.__init__ to adapt conv AFTER
+        # load_pretrain_weights has loaded 3ch weights. This runs only for
+        # the training model (not the inference model in _build_model_context).
+        original_module_init = mm.RFDETRModelModule.__init__
+        def patched_module_init(self, model_config, train_config):
+            original_module_init(self, model_config, train_config)
+            if getattr(model_config, "num_channels", 3) != 3:
+                _fix_6ch_conv(self.model, model_config)
+        mm.RFDETRModelModule.__init__ = patched_module_init
+
+        print("  6-channel exposure mode enabled")
+
     # ---- Step 2: Initialize model ----
     print("\n[2/3] Initializing model...")
     t0 = time.time()
@@ -382,6 +656,8 @@ def main():
         "num_classes": args.num_classes,
         "proj_size": args.proj_size,
     }
+    if args.use_exposure:
+        model_kwargs["num_channels"] = 6
     if args.resolution is not None:
         model_kwargs["resolution"] = args.resolution
     if args.freeze_encoder:
@@ -409,6 +685,7 @@ def main():
         epochs=args.epochs,
         batch_size=batch_size_arg,
         grad_accum_steps=args.grad_accum_steps,
+        warmup_epochs=args.warmup_epochs,
         output_dir=output_dir,
         lr=args.lr,
         lr_encoder=args.lr_encoder,
@@ -417,6 +694,8 @@ def main():
         class_names=CLASS_NAMES,
         early_stopping=True,
         early_stopping_patience=args.early_stopping_patience,
+        skip_best_epochs=args.skip_best_epochs,
+        lr_scheduler="step" if args.no_cosine else "cosine",
         num_workers=args.num_workers,
         seed=args.seed,
         tensorboard=True,
@@ -424,17 +703,14 @@ def main():
         use_ema=not args.no_ema,
         fp16_eval=args.fp16_eval,
         aug_config={
-            "HorizontalFlip": {"p": 0.3},
-            "VerticalFlip": {"p": 0.3},
-            "Rotate": {"limit": (-2, 2), "border_mode": 4, "p": 0.1},
-            "RandomScale": {"scale_limit": 0.005, "p": 0.1},
-            "RandomGamma": {"gamma_limit": (80, 120), "p": 0.1},
-            "Sharpen": {"alpha": (0.1, 0.4), "lightness": (1.0, 1.0), "p": 0.1},
-            "RandomBrightnessContrast": {
-                "brightness_limit": 0.15,
-                "contrast_limit": 0.15,
-                "p": 0.3,
-            },
+            "HorizontalFlip": {"p": 0.5},
+            "VerticalFlip": {"p": 0.5},
+            "RandomBrightnessContrast": {"brightness_limit": 0.25, "contrast_limit": 0.25, "p": 0.6},
+            "CLAHE": {"clip_limit": 4.0, "tile_grid_size": (8, 8), "p": 0.5},
+            "RandomGamma": {"gamma_limit": (80, 120), "p": 0.3},
+            "Sharpen": {"alpha": (0.2, 0.5), "lightness": (0.5, 1.0), "p": 0.3},
+            "GaussNoise": {"p": 0.2},
+            "GaussianBlur": {"blur_limit": 3, "p": 0.15},
         },
     )
 

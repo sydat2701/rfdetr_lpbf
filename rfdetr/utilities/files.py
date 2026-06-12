@@ -15,7 +15,7 @@ from tqdm.auto import tqdm
 from rfdetr.utilities.logger import get_logger
 
 logger = get_logger()
-DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 30.0
+DEFAULT_DOWNLOAD_TIMEOUT_SECONDS = 300.0
 
 
 def _compute_file_md5(filepath: str) -> str:
