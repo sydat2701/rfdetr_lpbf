@@ -91,6 +91,7 @@ class ModelDefaults:
     backbone_only: bool = False
     aux_loss: bool = True
     focal_alpha: float = 0.25
+    class_alpha: Optional[list[float]] = None
     set_cost_class: float = 2.0
     set_cost_bbox: float = 5.0
     set_cost_giou: float = 2.0

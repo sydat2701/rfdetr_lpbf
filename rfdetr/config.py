@@ -125,6 +125,11 @@ class ModelConfig(BaseConfig):
     mask_downsample_ratio: int = 4
     backbone_lora: bool = False
     freeze_encoder: bool = False
+    class_alpha: Optional[List[float]] = Field(
+        default=None,
+        description="Per-class alpha weights for focal loss. List of length num_classes. "
+                    "Classes with higher alpha contribute more to the loss.",
+    )
     license: str = "Apache-2.0"
     model_name: Optional[str] = Field(
         default=None,
@@ -615,6 +620,7 @@ class TrainConfig(BaseModel):
     lr_drop: int = 100
     checkpoint_interval: int = Field(default=10, ge=1)
     skip_best_epochs: int = Field(default=0, ge=0)
+    monitor_metric: str = "mAP_50"
     warmup_epochs: float = 0.0
     lr_vit_layer_decay: float = 0.8
     lr_component_decay: float = 0.7

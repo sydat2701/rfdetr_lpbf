@@ -482,6 +482,9 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
         losses.append("masks")
 
     sum_group_losses = getattr(args, "sum_group_losses", False)
+    class_alpha_raw = getattr(args, "class_alpha", None)
+    class_alpha = torch.tensor(class_alpha_raw, dtype=torch.float32) if class_alpha_raw is not None else None
+
     if args.segmentation_head:
         criterion = SetCriterion(
             args.num_classes + 1,
@@ -495,6 +498,7 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             use_position_supervised_loss=args.use_position_supervised_loss,
             ia_bce_loss=args.ia_bce_loss,
             mask_point_sample_ratio=args.mask_point_sample_ratio,
+            class_alpha=class_alpha,
         )
     else:
         criterion = SetCriterion(
@@ -508,6 +512,7 @@ def build_criterion_and_postprocessors(args: "BuilderArgs"):
             use_varifocal_loss=args.use_varifocal_loss,
             use_position_supervised_loss=args.use_position_supervised_loss,
             ia_bce_loss=args.ia_bce_loss,
+            class_alpha=class_alpha,
         )
     criterion.to(device)
     postprocess = PostProcess(num_select=args.num_select)

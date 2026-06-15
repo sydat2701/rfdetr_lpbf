@@ -23,6 +23,7 @@ _MC_NAMESPACE_FIELDS = {
     "backbone_lora",
     "bbox_reparam",
     "ca_nheads",
+    "class_alpha",
     "dec_layers",
     "dec_n_points",
     "device",

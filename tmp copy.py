@@ -6,11 +6,6 @@ import os
 import sys
 from collections import Counter, defaultdict
 
-# Use local rfdetr/rfdetr_plus copies instead of site-packages
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-
-from train import get_model_class, prepare_dataset
-
 
 AUG_LOW_CONTRAST_SMALL_DEFECT = {
     "HorizontalFlip": {"p": 0.5},
@@ -27,13 +22,13 @@ AUG_LOW_CONTRAST_SMALL_DEFECT = {
 # 2. CẤU HÌNH TRAINING MẶC ĐỊNH
 # =============================================================================
 DEFAULTS = dict(
-    model="xlarge",        # nano|small|medium|base|large  (good speed/accuracy tradeoff)
-    resolution=896,        # Valid resolutions vary by model (16*num_windows).
-                           #   896 = 32*28 = 56*16 -> SAFE for all variants.
-                           #   Small defects → use HIGHER: try 1024 (divisible by 32) or
-                           #   1120 (safe for all models) if GPU has enough VRAM.
+    model="medium",        # nano|small|medium|base|large  (medium: cân bằng tốt độ/độ chính xác)
+    resolution=896,        # Bội số hợp lệ KHÁC NHAU tuỳ model (16*num_windows).
+                           #   896 = 32*28 = 56*16 -> AN TOÀN cho mọi biến thể.
+                           #   Lỗi nhỏ -> để CAO: thử 1024 (model chia hết 32) hoặc
+                           #   1120 (an toàn mọi model) nếu GPU đủ VRAM.
     epochs=80,
-    batch_size=2,          # mini-batch per GPU; reduce to 2 if OOM
+    batch_size=4,          # mini-batch mỗi GPU; giảm còn 2 nếu hết VRAM
     grad_accum_steps=4,    # effective batch = batch_size * grad_accum_steps * num_gpus = 16
     lr=1e-4,
     lr_encoder=1.5e-4,
@@ -59,18 +54,18 @@ MODEL_CLASSES = {
 
 
 # =============================================================================
-# STEP 1: DATASET CHECK
+# BƯỚC 1: KIỂM TRA DATASET
 # =============================================================================
 def step_check(dataset_dir):
     print("=" * 70)
-    print("STEP 1 — DATASET CHECK")
+    print("BƯỚC 1 — KIỂM TRA DATASET")
     print("=" * 70)
     ok = True
     cat_names = None
     for split in ["train", "valid", "test"]:
         jpath = os.path.join(dataset_dir, split, "_annotations.coco.json")
         if not os.path.isfile(jpath):
-            print(f"  [MISSING] {jpath}")
+            print(f"  [THIẾU] {jpath}")
             ok = False
             continue
         d = json.load(open(jpath, encoding="utf-8"))
@@ -79,66 +74,61 @@ def step_check(dataset_dir):
             cat_names = cats
         dist = Counter(a["category_id"] for a in d["annotations"])
         ncls = sum(1 for cid in cats if dist.get(cid, 0) > 0)
-        # count images actually on disk
+        # đếm ảnh thực sự tồn tại trên đĩa
         img_dir = os.path.join(dataset_dir, split)
         missing = sum(1 for im in d["images"]
                       if not os.path.isfile(os.path.join(img_dir, im["file_name"])))
-        print(f"  [{split:<5}] imgs={len(d['images']):>5}  ann={len(d['annotations']):>7}  "
-              f"class={ncls}/{len(cats)}  missing-files={missing}")
+        print(f"  [{split:<5}] ảnh={len(d['images']):>5}  ann={len(d['annotations']):>7}  "
+              f"class={ncls}/{len(cats)}  ảnh-file-thiếu={missing}")
         per = "  ".join(f"{cats[c][:8]}={dist.get(c,0)}" for c in sorted(cats))
         print(f"          {per}")
         if missing:
-            print(f"          !! {missing} images in JSON but NO file on disk -> error during training.")
+            print(f"          !! Có {missing} ảnh trong JSON nhưng KHÔNG có file -> sẽ lỗi khi train.")
             ok = False
     print()
     if ok:
-        print(">> Dataset OK, ready to train.")
+        print(">> Dataset OK, sẵn sàng train.")
     else:
-        print(">> Dataset HAS ISSUES, fix before training.")
+        print(">> Dataset CÓ VẤN ĐỀ, hãy xử lý trước khi train.")
     return ok
 
 
 # =============================================================================
-# STEP 2: TRAINING
+# BƯỚC 2: TRAINING
 # =============================================================================
 def step_train(args):
     print("=" * 70)
-    print("STEP 2 — TRAINING RF-DETR")
+    print("BƯỚC 2 — TRAINING RF-DETR")
     print("=" * 70)
     import rfdetr
-    ModelClass = get_model_class(args.model)
+    ModelClass = getattr(rfdetr, MODEL_CLASSES[args.model])
 
     if args.resolution % 32 != 0 and args.resolution % 56 != 0:
-        print(f"  [!] resolution={args.resolution} may be invalid. "
-              f"Safe suggestions (divisible by both 32 & 56): 896, 1120. "
-              f"Or per model: multiples of 32 (e.g. 1024) or 56 (e.g. 1008).")
+        print(f"  [!] resolution={args.resolution} có thể không hợp lệ. "
+              f"Gợi ý an toàn (chia hết cả 32 & 56): 896, 1120. "
+              f"Hoặc theo model: bội số của 32 (vd 1024) hay 56 (vd 1008).")
 
-    # --- VRAM-saving preset (for large models / small GPUs like 16GB) ---
+    # --- Preset tiết kiệm VRAM (cho model lớn / GPU nhỏ như 16GB) ---
     if args.low_vram:
-        print("  [LOW-VRAM] Forcing batch_size=1, grad_accum=16, gradient_checkpointing=ON, EMA=OFF")
+        print("  [LOW-VRAM] Ép batch_size=1, grad_accum=16, gradient_checkpointing=ON, EMA=OFF")
         args.batch_size = 1
         args.grad_accum_steps = 16
         args.gradient_checkpointing = True
         args.use_ema = False
 
     if args.model in ("xlarge", "2xlarge"):
-        print("  [!] XLarge/2XLarge requires: pip install rfdetr_plus (PML 1.0 license).")
-        print("      On 16GB GPU, this model easily OOMs even at low resolution.")
-        print("      Consider --model large --resolution 1008, often better for small defects.")
+        print("  [!] XLarge/2XLarge cần: pip install rfdetr_plus  (giấy phép PML 1.0).")
+        print("      Trên GPU 16GB, model này rất dễ OOM kể cả ở resolution thấp.")
+        print("      Cân nhắc --model large --resolution 1008 thường tốt hơn cho lỗi nhỏ.")
 
-    # Init model. If custom .pth file given -> load as initial weights.
-    init_kwargs = dict(
-        resolution=args.resolution,
-        num_classes=args.num_classes,
-        num_queries=args.num_queries,
-        proj_size=args.proj_size,
-    )
+    # Khởi tạo model. Nếu có file .pth riêng -> nạp làm trọng số khởi đầu.
+    init_kwargs = dict(resolution=args.resolution)
     if args.pretrain_weights:
         init_kwargs["pretrain_weights"] = args.pretrain_weights
-        print(f"  Loading initial weights: {args.pretrain_weights}")
+        print(f"  Nạp trọng số khởi đầu: {args.pretrain_weights}")
     model = ModelClass(**init_kwargs)
 
-    # Choose augmentation
+    # Chọn augmentation
     if args.aug == "custom":
         aug_config = AUG_LOW_CONTRAST_SMALL_DEFECT
     elif args.aug == "industrial":
@@ -147,7 +137,7 @@ def step_train(args):
     elif args.aug == "conservative":
         from rfdetr.datasets.aug_config import AUG_CONSERVATIVE
         aug_config = AUG_CONSERVATIVE
-    else:  # "default" -> only RF-DETR's default HorizontalFlip 50%
+    else:  # "default" -> chỉ HorizontalFlip 50% của RF-DETR
         aug_config = None
 
     print(f"  Model        : {MODEL_CLASSES[args.model]}")
@@ -183,16 +173,16 @@ def step_train(args):
         train_kwargs["resume"] = args.resume
 
     model.train(**train_kwargs)
-    print("\n>> Training done. Best weights: ",
+    print("\n>> Train xong. Trọng số tốt nhất: ",
           os.path.join(args.output_dir, "checkpoint_best_total.pth"))
 
 
 # =============================================================================
-# STEP 3: TEST SET EVALUATION (AP per class)
+# BƯỚC 3: ĐÁNH GIÁ THEO TỪNG CLASS TRÊN TẬP TEST
 # =============================================================================
 def step_eval(args):
     print("=" * 70)
-    print("STEP 3 — TEST SET EVALUATION (AP per class)")
+    print("BƯỚC 3 — ĐÁNH GIÁ TRÊN TẬP TEST (AP từng class)")
     print("=" * 70)
     import numpy as np
     from PIL import Image
@@ -202,8 +192,8 @@ def step_eval(args):
 
     ckpt = args.weights or os.path.join(args.output_dir, "checkpoint_best_total.pth")
     if not os.path.isfile(ckpt):
-        sys.exit(f"Checkpoint not found: {ckpt}")
-    ModelClass = get_model_class(args.model)
+        sys.exit(f"Không thấy checkpoint: {ckpt}")
+    ModelClass = getattr(rfdetr, MODEL_CLASSES[args.model])
     model = ModelClass(pretrain_weights=ckpt, resolution=args.resolution)
 
     test_dir = os.path.join(args.dataset_dir, "test")
@@ -211,7 +201,7 @@ def step_eval(args):
     coco_gt = COCO(gt_json)
     cats = {c["id"]: c["name"] for c in coco_gt.loadCats(coco_gt.getCatIds())}
 
-    # Run inference, collect results in COCO detection format.
+    # Chạy dự đoán, gom kết quả theo định dạng COCO detection.
     results = []
     img_ids = coco_gt.getImgIds()
     for k, img_id in enumerate(img_ids, 1):
@@ -224,24 +214,24 @@ def step_eval(args):
         for (x1, y1, x2, y2), score, cls in zip(det.xyxy, det.confidence, det.class_id):
             results.append({
                 "image_id": img_id,
-                # NOTE: with 1-indexed COCO like this data, predicted class_id usually
-                # matches category_id. If AP=0 unexpectedly, check the id mapping here.
+                # LƯU Ý: với COCO 1-indexed như dữ liệu này, class_id dự đoán thường
+                # trùng category_id. Nếu AP=0 bất thường, kiểm tra lại ánh xạ id ở đây.
                 "category_id": int(cls),
                 "bbox": [float(x1), float(y1), float(x2 - x1), float(y2 - y1)],
                 "score": float(score),
             })
         if k % 50 == 0:
-            print(f"    ...predicted {k}/{len(img_ids)} images")
+            print(f"    ...đã dự đoán {k}/{len(img_ids)} ảnh")
 
     if not results:
-        sys.exit("Model predicted no boxes (try lowering --conf).")
+        sys.exit("Mô hình không dự đoán được box nào (thử giảm --conf).")
 
     coco_dt = coco_gt.loadRes(results)
     ev = COCOeval(coco_gt, coco_dt, iouType="bbox")
     ev.evaluate(); ev.accumulate(); ev.summarize()
 
-    # AP per class (mAP@[.5:.95] for each category)
-    print("\n=== AP PER CLASS (IoU .50:.95) ===")
+    # AP theo từng class (mAP@[.5:.95] cho mỗi category)
+    print("\n=== AP TỪNG CLASS (IoU .50:.95) ===")
     precisions = ev.eval["precision"]  # [T, R, K, A, M]
     cat_ids = coco_gt.getCatIds()
     for idx, cid in enumerate(cat_ids):
@@ -249,58 +239,37 @@ def step_eval(args):
         p = p[p > -1]
         ap = float(np.mean(p)) if p.size else float("nan")
         print(f"  {cats[cid]:<16}: AP = {ap:.4f}")
-    print("\n>> AP per class: rare classes (shortage/hole/powder residue) are usually low,")
-    print("   that's where more data or stronger augment/oversample is needed.")
+    print("\n>> Nhìn AP từng class: class hiếm (shortage/hole/powder residue) thường thấp,")
+    print("   đó là nơi cần thêm dữ liệu hoặc augment/oversample mạnh hơn.")
 
 
 # =============================================================================
-# STEP 4: EXPORT ONNX
+# BƯỚC 4: EXPORT ONNX
 # =============================================================================
 def step_export(args):
     print("=" * 70)
-    print("STEP 4 — EXPORT ONNX")
+    print("BƯỚC 4 — EXPORT ONNX")
     print("=" * 70)
     import rfdetr
     ckpt = args.weights or os.path.join(args.output_dir, "checkpoint_best_total.pth")
-    ModelClass = get_model_class(args.model)
+    ModelClass = getattr(rfdetr, MODEL_CLASSES[args.model])
     model = ModelClass(pretrain_weights=ckpt, resolution=args.resolution)
-    model.export()  # creates ONNX file in output (requires: pip install "rfdetr[onnxexport]")
-    print(">> ONNX exported (see output directory).")
+    model.export()  # tạo file ONNX trong output (cần: pip install "rfdetr[onnxexport]")
+    print(">> Đã export ONNX (xem thư mục output).")
 
 
 # =============================================================================
 # MAIN
 # =============================================================================
 def main():
-    ap = argparse.ArgumentParser(description="RF-DETR Pipeline for Surface Defect Detection.")
-    ap.add_argument("--dataset-dir", default=None, help="Dataset directory (contains train/valid/test).")
-    ap.add_argument("--annotation", default=None,
-        help="Path to COCO annotation JSON (alternative to --dataset-dir)")
-    ap.add_argument("--image-dir", default=None,
-        help="Image directory (required with --annotation)")
-    ap.add_argument("--val-object", default='SI3781',
-        help="Machine ID(s) for validation, comma-separated")
-    ap.add_argument("--test-object", default=None,
-        help="Machine ID(s) for test, comma-separated")
-    ap.add_argument("--exclude-object", default='SI3397',
-        help="Machine ID(s) to exclude, comma-separated")
-    ap.add_argument("--force", action="store_true",
-        help="Force re-prepare dataset")
-    ap.add_argument("--output", default="./rf-detr-output",
-        help="Output directory (for prepared dataset & checkpoints)")
-    ap.add_argument("--output-dir", default=None,
-        help="Alias for --output (legacy)")
+    ap = argparse.ArgumentParser(description="Pipeline RF-DETR cho phát hiện lỗi bề mặt.")
+    ap.add_argument("--dataset-dir", required=True, help="Thư mục dataset (chứa train/valid/test).")
+    ap.add_argument("--output-dir", default="output_rfdetr", help="Thư mục lưu log + checkpoint.")
     ap.add_argument("--steps", nargs="+", default=["check"],
                     choices=["check", "train", "eval", "export"],
-                    help="Steps to run, e.g.: --steps check train eval export")
+                    help="Các bước cần chạy, ví dụ: --steps check train eval export")
     # model / training
     ap.add_argument("--model", default=DEFAULTS["model"], choices=list(MODEL_CLASSES))
-    ap.add_argument("--num-classes", type=int, default=7,
-        help="Number of output classes")
-    ap.add_argument("--num-queries", type=int, default=100,
-        help="Number of object queries")
-    ap.add_argument("--proj-size", type=int, default=0,
-        help="Linear attention projection size (0 = disable)")
     ap.add_argument("--resolution", type=int, default=DEFAULTS["resolution"])
     ap.add_argument("--epochs", type=int, default=DEFAULTS["epochs"])
     ap.add_argument("--batch-size", type=int, default=DEFAULTS["batch_size"])
@@ -318,35 +287,17 @@ def main():
     ap.add_argument("--gradient-checkpointing", action="store_true",
                     default=DEFAULTS["gradient_checkpointing"])
     ap.add_argument("--low-vram", action="store_true",
-                    help="Small GPU preset: batch=1, accum=16, gradient_checkpointing, disable EMA.")
+                    help="Preset GPU nhỏ: batch=1, accum=16, gradient_checkpointing, tắt EMA.")
     ap.add_argument("--pretrain-weights", default=None,
-                    help=".pth path to load as initial weights (e.g. your 2xlarge file).")
+                    help="Đường dẫn .pth để nạp làm trọng số khởi đầu (vd file 2xlarge của bạn).")
     ap.add_argument("--aug", default="custom",
                     choices=["custom", "industrial", "conservative", "default"],
-                    help="custom=optimized for low-contrast images; industrial=factory preset.")
-    ap.add_argument("--resume", default=None, help="Path to last.ckpt to resume training.")
+                    help="custom=cấu hình tối ưu ảnh khó nhìn; industrial=preset công nghiệp.")
+    ap.add_argument("--resume", default=None, help="Đường dẫn last.ckpt để học tiếp.")
     # eval / export
-    ap.add_argument("--weights", default=None, help="Checkpoint for eval/export.")
-    ap.add_argument("--conf", type=float, default=0.25, help="Confidence threshold for evaluation.")
+    ap.add_argument("--weights", default=None, help="Checkpoint dùng cho eval/export.")
+    ap.add_argument("--conf", type=float, default=0.25, help="Ngưỡng tin cậy khi đánh giá.")
     args = ap.parse_args()
-
-    # Normalize output dir
-    if args.output_dir:
-        args.output = args.output_dir
-    if not args.output_dir:
-        args.output_dir = args.output
-
-    # Validate inputs
-    if not args.dataset_dir and not args.annotation:
-        ap.error("Provide --dataset-dir or --annotation + --image-dir")
-
-    # Prepare dataset from full annotation if given (runs before check/train/eval)
-    if args.annotation:
-        if not args.image_dir:
-            ap.error("--image-dir is required with --annotation")
-        print("Preparing dataset from full annotation...")
-        args.dataset_dir = prepare_dataset(args)
-        print(f"  Dataset prepared at: {args.dataset_dir}\n")
 
     if "check" in args.steps:
         step_check(args.dataset_dir)

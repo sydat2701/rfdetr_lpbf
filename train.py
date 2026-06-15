@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
+import cv2
 import torch
 import torch.nn as nn
 from PIL import Image
@@ -62,6 +63,131 @@ CLASS_NAMES = [
     "powder residue",
     "spatter",
 ]
+
+# Order must match CLASS_NAMES
+CAT_NAME_TO_IDX = {name: i for i, name in enumerate(CLASS_NAMES)}
+
+
+def compute_class_alpha(annotation_path: str, val_objects: set, test_objects: set, exclude_objects: set,
+                        alpha_base: float = 0.25, power: float = 0.5) -> list[float]:
+    """Compute per-class focal loss alpha weights inversely proportional to class frequency.
+
+    Rare classes get higher alpha (more weight on positive examples), common classes
+    get lower alpha. The average alpha across classes is approximately alpha_base.
+
+    Returns:
+        List of alpha values per class in CLASS_NAMES order.
+    """
+    with open(annotation_path) as f:
+        coco = json.load(f)
+
+    cat_name_to_id = {cat["name"]: cat["id"] for cat in coco["categories"]}
+    cat_id_to_name = {cat["id"]: cat["name"] for cat in coco["categories"]}
+
+    img_machine = {}
+    for img in coco["images"]:
+        m = re.search(r"(SI\d{4})", img["file_name"].upper())
+        if m:
+            img_machine[img["id"]] = m.group(1)
+
+    # Count annotations per class, only for training machines
+    train_machines = set(img_machine.values()) - val_objects - test_objects - exclude_objects
+    class_counts = {name: 0 for name in CLASS_NAMES}
+    for ann in coco["annotations"]:
+        mach = img_machine.get(ann["image_id"])
+        if mach in train_machines:
+            cat_name = cat_id_to_name.get(ann["category_id"])
+            if cat_name in class_counts:
+                class_counts[cat_name] += 1
+
+    total = sum(class_counts.values())
+    n_classes = len(CLASS_NAMES)
+
+    alphas = []
+    for name in CLASS_NAMES:
+        count = class_counts[name]
+        if count == 0:
+            alphas.append(0.5)
+        else:
+            weight = (total / (n_classes * count)) ** power
+            alpha = alpha_base * weight
+            alphas.append(max(0.01, min(0.99, alpha)))
+
+    return alphas
+
+# Machine-specific ROI points for perspective crop (4 corners of print bed).
+# Each entry: [top-left, top-right, bottom-right, bottom-left] in (x, y).
+MACHINE_ROIS = {
+    "SI2028": [[250, 96], [1272, 116], [1272, 908], [182, 902]],
+    "SI2674": [[190, 114], [1276, 122], [1272, 922], [132, 926]],
+    "SI3073": [[176, 114], [1276, 132], [1276, 926], [96, 930]],
+    "SI3074": [[200, 132], [1276, 136], [1272, 932], [136, 940]],
+    "SI3186": [[245, 87], [1271, 107], [1271, 928], [150, 913]],
+    "SI3397": [[114, 276], [903, 264], [1032, 1071], [6, 1100]],
+    "SI3588": [[160, 306], [934, 324], [1046, 1206], [4, 1206]],
+    "SI3781": [[203, 109], [1280, 134], [1280, 943], [123, 941]],
+    "SI3783": [[240, 105], [1280, 122], [1280, 936], [154, 921]],
+    "SI3785": [[233, 122], [1280, 114], [1280, 928], [166, 942]],
+    "SI3794": [[241, 121], [1280, 137], [1280, 936], [142, 936]],
+    "SI3803": [[221, 101], [1280, 106], [1280, 936], [142, 936]],
+    "SI4222": [[250, 108], [1280, 122], [1280, 940], [162, 933]],
+}
+
+
+def get_machine_roi(file_path):
+    """Look up ROI points for a machine ID in the given path. Returns None if not found."""
+    for mid in MACHINE_ROIS:
+        if mid in file_path:
+            return np.array(MACHINE_ROIS[mid], dtype=np.float32)
+    return None
+
+
+def machine_based_crop(img_np, file_path):
+    """Perspective-crop image to the machine's print bed region.
+
+    Args:
+        img_np: H×W×3 uint8 or float32 image array.
+        file_path: Path containing machine ID (e.g. 'SI3073...').
+
+    Returns:
+        (cropped_img, transform_matrix) where cropped_img is the warped output
+        and M is the 3×3 perspective transform. If no ROI is found, returns
+        (img_np, identity_3x3).
+    """
+    pts = get_machine_roi(file_path)
+    if pts is None:
+        return img_np, np.eye(3, dtype=np.float32)
+
+    width_a = np.linalg.norm(pts[2] - pts[3])
+    width_b = np.linalg.norm(pts[1] - pts[0])
+    max_w = int(max(width_a, width_b))
+
+    height_a = np.linalg.norm(pts[1] - pts[2])
+    height_b = np.linalg.norm(pts[0] - pts[3])
+    max_h = int(max(height_a, height_b))
+
+    dst = np.array([[0, 0], [max_w - 1, 0], [max_w - 1, max_h - 1], [0, max_h - 1]], dtype=np.float32)
+    M = cv2.getPerspectiveTransform(pts, dst)
+    warped = cv2.warpPerspective(img_np, M, (max_w, max_h))
+    return warped, M
+
+
+def warp_coco_bbox(bbox, M, orig_w, orig_h, crop_w, crop_h):
+    """Warp a single COCO bbox [x, y, w, h] using perspective matrix M.
+
+    Returns the new axis-aligned bbox [x', y', w', h'] clipped to crop bounds.
+    """
+    x, y, w, h = bbox
+    corners = np.array([[x, y], [x + w, y], [x + w, y + h], [x, y + h]], dtype=np.float32)
+    corners = cv2.perspectiveTransform(corners.reshape(1, -1, 2), M).reshape(-1, 2)
+    xs = corners[:, 0]
+    ys = corners[:, 1]
+    x1 = max(0, xs.min())
+    y1 = max(0, ys.min())
+    x2 = min(crop_w, xs.max())
+    y2 = min(crop_h, ys.max())
+    return [x1, y1, x2 - x1, y2 - y1]
+
 
 
 def extract_object_id(file_name):
@@ -222,28 +348,53 @@ def prepare_dataset(args):
                 shutil.copy2(src_path, dst_path)
                 copied += 1
 
+            # Apply machine-based perspective crop to bed region
+            img_bgr = cv2.imread(dst_path)
+            if img_bgr is not None:
+                img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                img_cropped, M = machine_based_crop(img_rgb, dst_path)
+                crop_h, crop_w = img_cropped.shape[:2]
+                # Save cropped image back (only if transform was applied)
+                if not np.array_equal(M, np.eye(3, dtype=np.float32)):
+                    cv2.imwrite(dst_path, cv2.cvtColor(img_cropped, cv2.COLOR_RGB2BGR))
+            else:
+                M = np.eye(3, dtype=np.float32)
+                crop_w, crop_h = img["width"], img["height"]
+
+            # Apply same crop to exposure pair
             if expo_src is not None:
                 expo_dst = os.path.join(split_dir, "exposure", dst_filename)
                 os.makedirs(os.path.dirname(expo_dst), exist_ok=True)
                 if not os.path.exists(expo_dst) or args.force:
                     shutil.copy2(expo_src, expo_dst)
+                expo_bgr = cv2.imread(expo_dst)
+                if expo_bgr is not None:
+                    expo_rgb = cv2.cvtColor(expo_bgr, cv2.COLOR_BGR2RGB)
+                    expo_cropped, _ = machine_based_crop(expo_rgb, expo_dst)
+                    if not np.array_equal(M, np.eye(3, dtype=np.float32)):
+                        cv2.imwrite(expo_dst, cv2.cvtColor(expo_cropped, cv2.COLOR_RGB2BGR))
                 exposure_paths.append(expo_dst)
             else:
                 exposure_paths.append(None)
 
             split_images.append({
                 "id": img_id,
-                "width": img["width"],
-                "height": img["height"],
+                "width": crop_w,
+                "height": crop_h,
                 "file_name": dst_filename,
                 "license": 0,
                 "date_captured": "",
             })
 
+            # Warp bboxes using the perspective transform
             for ann in image_id_to_annotations.get(img_id, []):
                 new_ann = dict(ann)
                 new_ann["id"] = ann_id
                 ann_id += 1
+                if not np.array_equal(M, np.eye(3, dtype=np.float32)):
+                    new_ann["bbox"] = warp_coco_bbox(
+                        ann["bbox"], M, img["width"], img["height"], crop_w, crop_h
+                    )
                 split_annotations.append(new_ann)
 
         if skipped_no_exposure:
@@ -311,8 +462,8 @@ def make_paired_transforms(image_set, resolution, aug_config, gpu_postprocess):
     base = make_coco_transforms(
         image_set,
         resolution,
-        multi_scale=False,
-        expanded_scales=False,
+        multi_scale=True,
+        expanded_scales=True,
         skip_random_resize=False,
         patch_size=20,
         num_windows=2,
@@ -505,10 +656,12 @@ def parse_args(args=None):
     parser.add_argument("--variant", type=str, default="xlarge",
         choices=["nano", "small", "medium", "large", "xlarge", "2xlarge", "base"],
         help="RF-DETR model variant")
-    parser.add_argument("--resolution", type=int, default=1020,
-        help="Override input resolution (default: variant-specific)")
+    parser.add_argument("--resolution", type=int, default=700,
+        help="Override input resolution (default: 700 for xlarge, which is the default stride-matched size)")
     parser.add_argument("--num-classes", type=int, default=7,
         help="Number of output classes")
+    parser.add_argument("--num-queries", type=int, default=150,
+        help="Number of object queries (default: 150)")
     parser.add_argument("--proj-size", type=int, default=0,
         help="Linear attention projection size (0 = disable, use standard attention)")
     parser.add_argument("--use-exposure", type=str, default=False, nargs="?",
@@ -519,16 +672,16 @@ def parse_args(args=None):
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=100,
         help="Number of training epochs")
-    parser.add_argument("--batch-size", type=str, default="2",
+    parser.add_argument("--batch-size", type=str, default="auto",
         help="Per-GPU batch size or 'auto' for automatic probing")
-    parser.add_argument("--grad-accum-steps", type=int, default=4,
+    parser.add_argument("--grad-accum-steps", type=int, default=8,
         help="Gradient accumulation steps")
     parser.add_argument("--warmup-epochs", type=float, default=3.0,
         help="Number of warmup epochs (linear warmup from 0 to base LR)")
     parser.add_argument("--lr", type=float, default=1e-4,
         help="Base learning rate")
-    parser.add_argument("--lr-encoder", type=float, default=1.5e-4,
-        help="Encoder learning rate")
+    parser.add_argument("--lr-encoder", type=float, default=1e-5,
+        help="Encoder learning rate (lower than base LR to preserve pretrained features)")
     parser.add_argument("--num-workers", type=int, default=4,
         help="DataLoader workers")
     parser.add_argument("--seed", type=int, default=42,
@@ -541,10 +694,15 @@ def parse_args(args=None):
         help="Disable Exponential Moving Average")
     parser.add_argument("--early-stopping-patience", type=int, default=30,
         help="Early stopping patience (epochs)")
-    parser.add_argument("--skip-best-epochs", type=int, default=5,
+    parser.add_argument("--skip-best-epochs", type=int, default=0,
         help="Skip first N epochs for early stopping best-score tracking")
+    parser.add_argument("--monitor-metric", type=str, default="mAP_50",
+        choices=["mAP_50", "mAP_50_95"],
+        help="Validation metric to monitor for best checkpoint / early stopping")
     parser.add_argument("--no-cosine", action="store_true",
         help="Use step LR scheduler instead of cosine decay")
+    parser.add_argument("--class-alpha-power", type=float, default=0.6,
+        help="Power for inverse-frequency scaling of focal loss alpha (0 = uniform, 1 = fully inverse)")
     parser.add_argument("--fp16-eval", action="store_true",
         help="Use FP16 for evaluation")
     parser.add_argument("--freeze-encoder", action="store_true",
@@ -553,8 +711,8 @@ def parse_args(args=None):
         help="Apply LoRA to the backbone")
 
     # Logging
-    parser.add_argument("--wandb", action="store_true",
-        help="Enable Weights & Biases logging")
+    parser.add_argument("--no-wandb", action="store_true",
+        help="Disable Weights & Biases logging (enabled by default)")
     parser.add_argument("--run-name", type=str, default=None,
         help="Custom run name for logging (default: auto-generated)")
 
@@ -654,6 +812,7 @@ def main():
 
     model_kwargs = {
         "num_classes": args.num_classes,
+        "num_queries": args.num_queries,
         "proj_size": args.proj_size,
     }
     if args.use_exposure:
@@ -664,6 +823,16 @@ def main():
         model_kwargs["freeze_encoder"] = True
     if args.backbone_lora:
         model_kwargs["backbone_lora"] = True
+
+    # Compute per-class focal loss alpha weights from training data
+    val_objects = set(o.strip() for o in args.val_object.split(",")) if args.val_object else set()
+    test_objects = set(o.strip() for o in args.test_object.split(",")) if args.test_object else set()
+    exclude_objects = set(o.strip() for o in args.exclude_object.split(",")) if args.exclude_object else set()
+    class_alpha = compute_class_alpha(args.annotation, val_objects, test_objects, exclude_objects,
+                                       power=args.class_alpha_power)
+    model_kwargs["class_alpha"] = class_alpha
+
+    print(f"  Class alpha weights: {dict(zip(CLASS_NAMES, [round(a, 3) for a in class_alpha]))}")
 
     model = ModelClass(**model_kwargs)
     print(f"  Model {args.variant} initialized ({time.time() - t0:.1f}s)")
@@ -695,11 +864,12 @@ def main():
         early_stopping=True,
         early_stopping_patience=args.early_stopping_patience,
         skip_best_epochs=args.skip_best_epochs,
+        monitor_metric=args.monitor_metric,
         lr_scheduler="step" if args.no_cosine else "cosine",
         num_workers=args.num_workers,
         seed=args.seed,
         tensorboard=True,
-        wandb=args.wandb,
+        wandb=not args.no_wandb,
         use_ema=not args.no_ema,
         fp16_eval=args.fp16_eval,
         aug_config={

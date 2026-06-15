@@ -9,6 +9,8 @@
 # ------------------------------------------------------------------------
 """Loss functions and criterion for RF-DETR training."""
 
+from typing import Optional
+
 import torch
 import torch.nn.functional as F  # noqa: N812
 from torch import nn
@@ -34,7 +36,9 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
                  classification label for each element in inputs
                 (0 for the negative class and 1 for the positive class).
         alpha: (optional) Weighting factor in range (0,1) to balance
-                positive vs negative examples. Default = -1 (no weighting).
+                positive vs negative examples. Can be a float (applied uniformly)
+                or a 1D tensor [num_classes] for per-class alpha weights.
+                Default = 0.25.
         gamma: Exponent of the modulating factor (1 - p_t) to
                balance easy vs hard examples.
 
@@ -46,7 +50,10 @@ def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: f
     p_t = prob * targets + (1 - prob) * (1 - targets)
     loss = ce_loss * ((1 - p_t) ** gamma)
 
-    if alpha >= 0:
+    if isinstance(alpha, torch.Tensor):
+        alpha_t = targets * alpha.unsqueeze(0).unsqueeze(0) + (1 - targets) * (1 - alpha).unsqueeze(0).unsqueeze(0)
+        loss = alpha_t * loss
+    elif alpha >= 0:
         alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
         loss = alpha_t * loss
 
@@ -146,6 +153,7 @@ class SetCriterion(nn.Module):
         use_position_supervised_loss=False,
         ia_bce_loss=False,
         mask_point_sample_ratio: int = 16,
+        class_alpha: Optional[torch.Tensor] = None,
     ):
         """Create the criterion.
 
@@ -154,8 +162,10 @@ class SetCriterion(nn.Module):
             matcher: module able to compute a matching between targets and proposals
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             losses: list of all the losses to be applied. See get_loss for list of available losses.
-            focal_alpha: alpha in Focal Loss
+            focal_alpha: alpha in Focal Loss (float or per-class tensor)
             group_detr: Number of groups to speed detr training. Default is 1.
+            class_alpha: Optional per-class alpha weights [num_classes] tensor.
+                Overrides focal_alpha for the default (non-ia_bce) loss path.
         """
         super().__init__()
         self.num_classes = num_classes
@@ -163,6 +173,7 @@ class SetCriterion(nn.Module):
         self.weight_dict = weight_dict
         self.losses = losses
         self.focal_alpha = focal_alpha
+        self.class_alpha = class_alpha
         self.group_detr = group_detr
         self.sum_group_losses = sum_group_losses
         self.use_varifocal_loss = use_varifocal_loss
@@ -297,12 +308,13 @@ class SetCriterion(nn.Module):
             target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
             target_classes_onehot = target_classes_onehot[:, :, :-1]
+            _alpha = self.class_alpha if self.class_alpha is not None else self.focal_alpha
             loss_ce = (
                 sigmoid_focal_loss(
                     src_logits,
                     target_classes_onehot,
                     num_boxes,
-                    alpha=self.focal_alpha,
+                    alpha=_alpha,
                     gamma=2,
                 )
                 * src_logits.shape[1]
