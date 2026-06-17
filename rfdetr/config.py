@@ -635,6 +635,7 @@ class TrainConfig(BaseModel):
     output_dir: str = "output"
     multi_scale: bool = True
     expanded_scales: bool = True
+    skip_random_crop: bool = True
     do_random_resize_via_padding: bool = False
     use_ema: bool = True
     ema_update_interval: int = 1

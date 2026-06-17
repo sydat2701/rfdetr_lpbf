@@ -2,8 +2,10 @@
 """
 RF-DETR Training Script for L-PBF Anomaly Detection.
 
-Splits data by machine ID (--val-object, --test-object) to ensure
+By default, splits data by machine ID (--val-object, --test-object) to ensure
 generalization across different print beds / camera setups.
+Use --mix-train-val to randomly split all non-test images into train/val instead,
+which gives more reliable validation metrics during training.
 Supports RFDETR2XLarge via the rfdetr_plus extension.
 """
 
@@ -15,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import argparse
 import json
+import random
 import re
 import shutil
 import time
@@ -28,6 +31,9 @@ import torch
 import torch.nn as nn
 from PIL import Image
 from torchvision.transforms.v2 import Compose, ToDtype, ToImage
+
+from pytorch_lightning import LightningModule, Trainer
+from pytorch_lightning.callbacks import Callback
 
 from rfdetr.datasets.coco import CocoDetection, build_roboflow_from_coco, make_coco_transforms
 from rfdetr.datasets.transforms import AlbumentationsWrapper, Normalize
@@ -186,7 +192,7 @@ def warp_coco_bbox(bbox, M, orig_w, orig_h, crop_w, crop_h):
     y1 = max(0, ys.min())
     x2 = min(crop_w, xs.max())
     y2 = min(crop_h, ys.max())
-    return [x1, y1, x2 - x1, y2 - y1]
+    return [float(x1), float(y1), float(x2 - x1), float(y2 - y1)]
 
 
 
@@ -269,23 +275,51 @@ def prepare_dataset(args):
     split_image_ids = {"train": [], "valid": [], "test": []}
     missing_count = 0
     excluded_count = 0
-    for img in coco["images"]:
-        img_id = img["id"]
-        obj_id = extract_object_id(img["file_name"])
-        if obj_id is None:
-            continue
-        if image_path_cache.get(img_id) is None:
-            missing_count += 1
-            continue
-        if obj_id in exclude_objects:
-            excluded_count += 1
-            continue
-        if obj_id in test_objects:
-            split_image_ids["test"].append(img_id)
-        elif obj_id in val_objects:
-            split_image_ids["valid"].append(img_id)
-        else:
-            split_image_ids["train"].append(img_id)
+
+    if args.mix_train_val == "True":
+        print(f"  Split mode: mixed (random {1-args.mix_val_split:.0%}/{args.mix_val_split:.0%} "
+              f"train/val, test={sorted(test_objects) if test_objects else 'none'})")
+        remaining_ids = []
+        for img in coco["images"]:
+            img_id = img["id"]
+            obj_id = extract_object_id(img["file_name"])
+            if obj_id is None:
+                continue
+            if image_path_cache.get(img_id) is None:
+                missing_count += 1
+                continue
+            if obj_id in exclude_objects:
+                excluded_count += 1
+                continue
+            if obj_id in test_objects:
+                split_image_ids["test"].append(img_id)
+            else:
+                remaining_ids.append(img_id)
+
+        random.seed(args.seed)
+        random.shuffle(remaining_ids)
+        val_count = int(len(remaining_ids) * args.mix_val_split)
+        split_image_ids["valid"] = remaining_ids[:val_count]
+        split_image_ids["train"] = remaining_ids[val_count:]
+    else:
+        # Original behavior: split by machine ID
+        for img in coco["images"]:
+            img_id = img["id"]
+            obj_id = extract_object_id(img["file_name"])
+            if obj_id is None:
+                continue
+            if image_path_cache.get(img_id) is None:
+                missing_count += 1
+                continue
+            if obj_id in exclude_objects:
+                excluded_count += 1
+                continue
+            if obj_id in test_objects:
+                split_image_ids["test"].append(img_id)
+            elif obj_id in val_objects:
+                split_image_ids["valid"].append(img_id)
+            else:
+                split_image_ids["train"].append(img_id)
 
     if excluded_count:
         print(f"  Excluded: {excluded_count} images from {sorted(exclude_objects)}")
@@ -465,6 +499,7 @@ def make_paired_transforms(image_set, resolution, aug_config, gpu_postprocess):
         multi_scale=True,
         expanded_scales=True,
         skip_random_resize=False,
+        skip_random_crop=True,
         patch_size=20,
         num_windows=2,
         aug_config=aug_config,
@@ -652,11 +687,17 @@ def parse_args(args=None):
     parser.add_argument("--exclude-object", type=str, default='SI3397',
         help="Machine ID(s) to exclude entirely, comma-separated (e.g. 'SI3397')")
 
+    # Mixed train/val split (random 80/20 across all non-test machines)
+    parser.add_argument("--mix-train-val", type=str, default="True", choices=["True", "False"],
+        help="Split all non-test images randomly into train/val instead of by machine ID")
+    parser.add_argument("--mix-val-split", type=float, default=0.2,
+        help="Validation fraction when --mix-train-val is True (default: 0.2)")
+
     # Model
     parser.add_argument("--variant", type=str, default="xlarge",
         choices=["nano", "small", "medium", "large", "xlarge", "2xlarge", "base"],
         help="RF-DETR model variant")
-    parser.add_argument("--resolution", type=int, default=700,
+    parser.add_argument("--resolution", type=int, default=1020,
         help="Override input resolution (default: 700 for xlarge, which is the default stride-matched size)")
     parser.add_argument("--num-classes", type=int, default=7,
         help="Number of output classes")
@@ -672,7 +713,7 @@ def parse_args(args=None):
     # Training hyperparameters
     parser.add_argument("--epochs", type=int, default=100,
         help="Number of training epochs")
-    parser.add_argument("--batch-size", type=str, default="auto",
+    parser.add_argument("--batch-size", type=str, default=2,
         help="Per-GPU batch size or 'auto' for automatic probing")
     parser.add_argument("--grad-accum-steps", type=int, default=8,
         help="Gradient accumulation steps")
@@ -699,6 +740,8 @@ def parse_args(args=None):
     parser.add_argument("--monitor-metric", type=str, default="mAP_50",
         choices=["mAP_50", "mAP_50_95"],
         help="Validation metric to monitor for best checkpoint / early stopping")
+    parser.add_argument("--random-crop", action="store_true",
+        help="Enable random crop during training (default: disabled, full image used)")
     parser.add_argument("--no-cosine", action="store_true",
         help="Use step LR scheduler instead of cosine decay")
     parser.add_argument("--class-alpha-power", type=float, default=0.6,
@@ -716,11 +759,111 @@ def parse_args(args=None):
     parser.add_argument("--run-name", type=str, default=None,
         help="Custom run name for logging (default: auto-generated)")
 
+    # Debug
+    parser.add_argument("--debug-vis", action="store_true",
+        help="Save augmented validation images with GT bboxes for inspection")
+
     # Resume
     parser.add_argument("--resume", type=str, default=None,
         help="Path to checkpoint to resume from")
 
     return parser.parse_args(args)
+
+
+# ---------------------------------------------------------------------------
+# Debug visualization callback
+# ---------------------------------------------------------------------------
+_IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406])
+_IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])
+_COLORS = [
+    (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+    (255, 0, 255), (0, 255, 255), (128, 128, 255),
+]
+
+
+def _denorm_image(img_tensor):
+    """Convert [C,H,W] normalized tensor to H×W×3 uint8 numpy (first 3 channels)."""
+    img = img_tensor[:3].float().cpu()
+    if img.ndim == 3:
+        for c in range(3):
+            img[c] = img[c] * _IMAGENET_STD[c] + _IMAGENET_MEAN[c]
+    img = img.clamp(0, 1).mul(255).byte()
+    return img.permute(1, 2, 0).numpy()
+
+
+def _draw_bboxes(img_np, boxes, labels, class_names):
+    """Draw COCO boxes [cx,cy,w,h] normalized on image, return copy."""
+    h, w = img_np.shape[:2]
+    out = img_np.copy()
+    for i, box in enumerate(boxes):
+        cx, cy, bw, bh = box
+        x1 = int((cx - bw / 2) * w)
+        y1 = int((cy - bh / 2) * h)
+        x2 = int((cx + bw / 2) * w)
+        y2 = int((cy + bh / 2) * h)
+        label = labels[i] if isinstance(labels[i], int) else labels[i].item()
+        color = _COLORS[label % len(_COLORS)]
+        cv2.rectangle(out, (x1, y1), (x2, y2), color, 2)
+        cls_name = class_names[label] if label < len(class_names) else str(label)
+        cv2.putText(out, cls_name, (x1, max(y1 - 4, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    return out
+
+
+class DebugVisCallback(Callback):
+    """Save augmented training images with GT bboxes to debug directory.
+
+    Activates only when ``--debug-vis`` is passed.  Saves images from training
+    batches during epoch 0 so you can verify the augmentation pipeline and
+    bbox alignment.
+    """
+
+    def __init__(self, output_dir: str, class_names: list[str],
+                 id_to_filename: dict[int, str] | None = None,
+                 max_samples: int = 30):
+        self._vis_dir = os.path.join(output_dir, "debug_vis")
+        self._class_names = class_names
+        self._id_to_filename = id_to_filename or {}
+        self._max_samples = max_samples
+
+    def on_train_batch_end(
+        self,
+        trainer: Trainer,
+        pl_module: LightningModule,
+        outputs: Any | None,
+        batch: Any,
+        batch_idx: int,
+    ) -> None:
+        images, targets = batch
+        if hasattr(images, "tensors"):
+            img_tensors = images.tensors
+        else:
+            img_tensors = images
+        epoch = trainer.current_epoch
+        save_dir = os.path.join(self._vis_dir, f"epoch_{epoch:03d}")
+        os.makedirs(save_dir, exist_ok=True)
+
+        already_saved = len(os.listdir(save_dir)) if os.path.exists(save_dir) else 0
+        remaining = self._max_samples - already_saved
+        if remaining <= 0:
+            return
+
+        n = min(len(img_tensors), remaining)
+        for i in range(n):
+            img_np = _denorm_image(img_tensors[i])
+            boxes = targets[i]["boxes"].cpu()
+            labels = targets[i]["labels"].cpu()
+            vis = _draw_bboxes(img_np, boxes, labels, self._class_names)
+
+            img_id_raw = targets[i].get("image_id")
+            img_id = img_id_raw.item() if hasattr(img_id_raw, "item") else img_id_raw
+            orig_name = self._id_to_filename.get(img_id, f"img_{already_saved + i:04d}")
+            stem = os.path.splitext(os.path.basename(orig_name))[0]
+            path = os.path.join(save_dir, f"{stem}.jpg")
+            cv2.imwrite(path, cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+
+        if already_saved + n >= self._max_samples:
+            pl_module.print(f"  [debug-vis] saved {self._max_samples} samples to {save_dir}")
 
 
 def main():
@@ -736,7 +879,9 @@ def main():
         parts = ["rfdetr", args.variant]
         if args.use_exposure:
             parts.append("6ch")
-        if args.val_object:
+        if args.mix_train_val == "True":
+            parts.append("mixed")
+        elif args.val_object:
             parts.append(f"val{args.val_object.replace(',', '_')}")
         if args.test_object:
             parts.append(f"test{args.test_object.replace(',', '_')}")
@@ -747,7 +892,8 @@ def main():
     print("=" * 70)
     print(f"  Variant:      {args.variant}")
     print(f"  Run name:     {run_name}")
-    print(f"  Val machines: {args.val_object or '(none)'}")
+    split_label = "mixed (random 80/20)" if args.mix_train_val == "True" else f"machine-based ({args.val_object or 'none'})"
+    print(f"  Train/val:    {split_label}")
     print(f"  Test machines:{args.test_object or '(none)'}")
     print(f"  Output:       {args.output}")
     print(f"  Epochs:       {args.epochs}")
@@ -825,7 +971,9 @@ def main():
         model_kwargs["backbone_lora"] = True
 
     # Compute per-class focal loss alpha weights from training data
-    val_objects = set(o.strip() for o in args.val_object.split(",")) if args.val_object else set()
+    val_objects = set() if args.mix_train_val == "True" else (
+        set(o.strip() for o in args.val_object.split(",")) if args.val_object else set()
+    )
     test_objects = set(o.strip() for o in args.test_object.split(",")) if args.test_object else set()
     exclude_objects = set(o.strip() for o in args.exclude_object.split(",")) if args.exclude_object else set()
     class_alpha = compute_class_alpha(args.annotation, val_objects, test_objects, exclude_objects,
@@ -865,6 +1013,7 @@ def main():
         early_stopping_patience=args.early_stopping_patience,
         skip_best_epochs=args.skip_best_epochs,
         monitor_metric=args.monitor_metric,
+        skip_random_crop=not args.random_crop,
         lr_scheduler="step" if args.no_cosine else "cosine",
         num_workers=args.num_workers,
         seed=args.seed,
@@ -875,17 +1024,24 @@ def main():
         aug_config={
             "HorizontalFlip": {"p": 0.5},
             "VerticalFlip": {"p": 0.5},
-            "RandomBrightnessContrast": {"brightness_limit": 0.25, "contrast_limit": 0.25, "p": 0.6},
+            "RandomBrightnessContrast": {"brightness_limit": [-0.15, 0.2], "contrast_limit": [-0.1, 0.15], "p": 0.6},
             "CLAHE": {"clip_limit": 4.0, "tile_grid_size": (8, 8), "p": 0.5},
-            "RandomGamma": {"gamma_limit": (80, 120), "p": 0.3},
-            "Sharpen": {"alpha": (0.2, 0.5), "lightness": (0.5, 1.0), "p": 0.3},
-            "GaussNoise": {"p": 0.2},
-            "GaussianBlur": {"blur_limit": 3, "p": 0.15},
+            "RandomGamma": {"gamma_limit": (95, 110), "p": 0.3},
+            "Sharpen": {"alpha": (0.1, 0.4), "lightness": (0.5, 1.0), "p": 0.3},
+            # "GaussNoise": {"p": 0.2},
+            "GaussianBlur": {"blur_limit": 2, "p": 0.15},
         },
     )
 
     if args.resume:
         train_kwargs["resume"] = args.resume
+
+    if args.debug_vis:
+        with open(args.annotation) as f:
+            coco_ann = json.load(f)
+        id_to_filename = {img["id"]: img["file_name"] for img in coco_ann["images"]}
+        debug_cb = DebugVisCallback(output_dir, CLASS_NAMES, id_to_filename=id_to_filename)
+        train_kwargs["extra_callbacks"] = [debug_cb]
 
     model.train(**train_kwargs)
 
@@ -895,3 +1051,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

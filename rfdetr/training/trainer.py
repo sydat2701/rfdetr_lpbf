@@ -92,6 +92,7 @@ def build_trainer(
     model_config: ModelConfig,
     *,
     accelerator: str | None = None,
+    extra_callbacks: list | None = None,
     **trainer_kwargs: Any,
 ) -> Trainer:
     """Assemble a PTL ``Trainer`` with the full RF-DETR callback and logger stack.
@@ -311,6 +312,10 @@ def build_trainer(
 
     if tc.clearml:
         raise NotImplementedError("ClearML logging is not yet supported. Remove clearml=True from TrainConfig.")
+
+    # Inject externally-provided callbacks (e.g. debug visualization).
+    if extra_callbacks:
+        callbacks.extend(extra_callbacks)
 
     # --- Promoted config fields (T4-2 added these to TrainConfig) ---
     clip_max_norm: float = tc.clip_max_norm

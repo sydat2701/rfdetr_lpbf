@@ -536,6 +536,7 @@ class RFDETR:
                 DeprecationWarning,
                 stacklevel=2,
             )
+        extra_callbacks = kwargs.pop("extra_callbacks", None)
 
         # Parse `device` kwarg and map it to PTL accelerator/devices.
         # Supports torch-style strings and torch.device (e.g. "cuda:1").
@@ -662,7 +663,7 @@ class RFDETR:
         trainer_kwargs = {"accelerator": _accelerator}
         if _devices is not None:
             trainer_kwargs["devices"] = _devices
-        trainer = build_trainer(config, self.model_config, **trainer_kwargs)
+        trainer = build_trainer(config, self.model_config, extra_callbacks=extra_callbacks, **trainer_kwargs)
         trainer.fit(module, datamodule, ckpt_path=config.resume or None)
 
         # Sync the trained weights back so predict() / export() see the updated model.
